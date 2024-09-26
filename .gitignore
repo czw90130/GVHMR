@@ -177,3 +177,6 @@ tensorboard
 
 # glove
 glove
+docs/color/
+docs/camera/
+*.7z

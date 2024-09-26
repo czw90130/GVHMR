@@ -8,6 +8,8 @@ import hydra
 from hydra import initialize_config_module, compose
 from pathlib import Path
 from pytorch3d.transforms import quaternion_to_matrix
+import os
+from PIL import Image
 
 from hmr4d.configs import register_store_gvhmr
 from hmr4d.utils.video_io_utils import (
@@ -34,23 +36,40 @@ from einops import einsum, rearrange
 
 
 CRF = 23  # 17 is lossless, every +6 halves the mp4 size
-
+# 17是无损压缩,每增加6会将mp4文件大小减半
 
 def parse_args_to_cfg():
     # Put all args to cfg
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, default="inputs/demo/dance_3.mp4")
+    parser.add_argument("--video", type=str, default=None)
+    parser.add_argument("--image_dir", type=str, default=None, help="Directory containing image sequence")
     parser.add_argument("--output_root", type=str, default=None, help="by default to outputs/demo")
     parser.add_argument("-s", "--static_cam", action="store_true", help="If true, skip DPVO")
-    parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
+    parser.add_argument("--verbose", default=True, action="store_true", help="If true, draw intermediate results")
     args = parser.parse_args()
 
     # Input
-    video_path = Path(args.video)
-    assert video_path.exists(), f"Video not found at {video_path}"
-    length, width, height = get_video_lwh(video_path)
-    Log.info(f"[Input]: {video_path}")
+    if args.video:
+        video_path = Path(args.video)
+        assert video_path.exists(), f"Video not found at {video_path}"
+        length, width, height = get_video_lwh(video_path)
+        Log.info(f"[Input]: Video {video_path}")
+    elif args.image_dir:
+        image_dir = Path(args.image_dir)
+        assert image_dir.exists(), f"图像目录未在 {image_dir} 找到"
+        support_format = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+        image_files = sorted([f for f in os.listdir(image_dir) if f.lower().endswith(support_format)])
+        assert len(image_files) > 0, f"在 {image_dir} 中未找到支持的图像文件"
+        sample_image = Image.open(os.path.join(image_dir, image_files[0]))
+        width, height = sample_image.size
+        length = len(image_files)
+        Log.info(f"[Input]: Image sequence from {image_dir}")
+        video_path = image_dir  # 使用图像目录路径代替视频路径
+    else:
+        raise ValueError("Either --video or --image_dir must be provided")
+
     Log.info(f"(L, W, H) = ({length}, {width}, {height})")
+
     # Cfg
     with initialize_config_module(version_base="1.3", config_module=f"hmr4d.configs"):
         overrides = [
@@ -70,15 +89,24 @@ def parse_args_to_cfg():
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.preprocess_dir).mkdir(parents=True, exist_ok=True)
 
-    # Copy raw-input-video to video_path
-    Log.info(f"[Copy Video] {video_path} -> {cfg.video_path}")
-    if not Path(cfg.video_path).exists() or get_video_lwh(video_path)[0] != get_video_lwh(cfg.video_path)[0]:
-        reader = get_video_reader(video_path)
+    # Process input to video_path
+    Log.info(f"[Process Input] {video_path} -> {cfg.video_path}")
+    if not Path(cfg.video_path).exists() or get_video_lwh(cfg.video_path)[0] != length:
+        if args.video:
+            reader = get_video_reader(video_path)
+        else:  # image_sequence
+            def image_sequence_reader():
+                for img_file in image_files:
+                    img = Image.open(os.path.join(image_dir, img_file))
+                    yield np.array(img)
+            reader = image_sequence_reader()
+
         writer = get_writer(cfg.video_path, fps=30, crf=CRF)
-        for img in tqdm(reader, total=get_video_lwh(video_path)[0], desc=f"Copy"):
+        for img in tqdm(reader, total=length, desc=f"Processing Input"):
             writer.write_frame(img)
         writer.close()
-        reader.close()
+        if args.video:
+            reader.close()
 
     return cfg
 
@@ -93,6 +121,7 @@ def run_preprocess(cfg):
     verbose = cfg.verbose
 
     # Get bbx tracking result
+    # 步骤1: YOLOv8 - 人体检测和跟踪
     if not Path(paths.bbx).exists():
         tracker = Tracker()
         bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
@@ -107,8 +136,12 @@ def run_preprocess(cfg):
         bbx_xyxy = torch.load(paths.bbx)["bbx_xyxy"]
         video_overlay = draw_bbx_xyxy_on_image_batch(bbx_xyxy, video)
         save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay)
+        
+    print(f"YOLOv8 结果保存路径: {paths.bbx}")
+    print(f"YOLOv8 可视化视频路径: {cfg.paths.bbx_xyxy_video_overlay}")
 
     # Get VitPose
+    # 步骤2: ViTPose - 2D关键点检测
     if not Path(paths.vitpose).exists():
         vitpose_extractor = VitPoseExtractor()
         vitpose = vitpose_extractor.extract(video_path, bbx_xys)
@@ -122,7 +155,11 @@ def run_preprocess(cfg):
         video_overlay = draw_coco17_skeleton_batch(video, vitpose, 0.5)
         save_video(video_overlay, paths.vitpose_video_overlay)
 
+    print(f"ViTPose 结果保存路径: {paths.vitpose}")
+    print(f"ViTPose 可视化视频路径: {paths.vitpose_video_overlay}")
+
     # Get vit features
+    # 步骤3: ViT特征提取 - 用于时序建模
     if not Path(paths.vit_features).exists():
         extractor = Extractor()
         vit_features = extractor.extract_video_features(video_path, bbx_xys)
@@ -131,7 +168,10 @@ def run_preprocess(cfg):
     else:
         Log.info(f"[Preprocess] vit_features from {paths.vit_features}")
 
+    print(f"ViT特征 保存路径: {paths.vit_features}")
+
     # Get DPVO results
+    # 步骤4: DPVO (可选) - 相机运动估计
     if not static_cam:  # use slam to get cam rotation
         if not Path(paths.slam).exists():
             length, width, height = get_video_lwh(cfg.video_path)
@@ -149,6 +189,8 @@ def run_preprocess(cfg):
             torch.save(slam_results, paths.slam)
         else:
             Log.info(f"[Preprocess] slam results from {paths.slam}")
+
+        print(f"DPVO 结果保存路径: {paths.slam}")
 
     Log.info(f"[Preprocess] End. Time elapsed: {Log.time()-tic:.2f}s")
 
@@ -286,10 +328,12 @@ if __name__ == "__main__":
     Log.info(f'[GPU]: {torch.cuda.get_device_properties("cuda")}')
 
     # ===== Preprocess and save to disk ===== #
+    # ===== 预处理并保存到磁盘 ===== #
     run_preprocess(cfg)
     data = load_data_dict(cfg)
 
     # ===== HMR4D ===== #
+    # ===== 步骤5: HMR4D (包含HMR2) - 3D人体姿态和形状估计 ===== #
     if not Path(paths.hmr4d_results).exists():
         Log.info("[HMR4D] Predicting")
         model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
@@ -302,9 +346,16 @@ if __name__ == "__main__":
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
         torch.save(pred, paths.hmr4d_results)
 
+    print(f"HMR4D 结果保存路径: {paths.hmr4d_results}")
+
     # ===== Render ===== #
+    # ===== 渲染结果 ===== #
     render_incam(cfg)
     render_global(cfg)
     if not Path(paths.incam_global_horiz_video).exists():
         Log.info("[Merge Videos]")
         merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+
+    print(f"In-camera 视频路径: {paths.incam_video}")
+    print(f"Global 视频路径: {paths.global_video}")
+    print(f"合并后的视频路径: {paths.incam_global_horiz_video}")
