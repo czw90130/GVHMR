@@ -219,43 +219,62 @@ def load_data_dict(cfg):
 
 
 def render_incam(cfg):
+    # 检查输出视频文件是否已存在
     incam_video_path = Path(cfg.paths.incam_video)
     if incam_video_path.exists():
         Log.info(f"[Render Incam] Video already exists at {incam_video_path}")
         return
 
+    # 加载HMR4D的预测结果
     pred = torch.load(cfg.paths.hmr4d_results)
+    # 初始化SMPL-X模型
     smplx = make_smplx("supermotion").cuda()
+    # 加载SMPL-X到SMPL的转换矩阵
     smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    # 获取SMPL模型的面信息
     faces_smpl = make_smplx("smpl").faces
 
     # smpl
+    # 使用预测的SMPL参数生成SMPL-X输出
     smplx_out = smplx(**to_cuda(pred["smpl_params_incam"]))
+    # 将SMPL-X顶点转换为SMPL顶点
     pred_c_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
 
     # -- rendering code -- #
+    # 获取输入视频的信息
     video_path = cfg.video_path
     length, width, height = get_video_lwh(video_path)
+    # 获取相机内参
     K = pred["K_fullimg"][0]
 
     # renderer
+    # 初始化渲染器
     renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
+    # 创建视频读取器
     reader = get_video_reader(video_path)  # (F, H, W, 3), uint8, numpy
+    # 加载边界框信息
     bbx_xys_render = torch.load(cfg.paths.bbx)["bbx_xys"]
 
     # -- render mesh -- #
+    # 准备渲染网格
     verts_incam = pred_c_verts
+    # 创建视频写入器
     writer = get_writer(incam_video_path, fps=30, crf=CRF)
     for i, img_raw in tqdm(enumerate(reader), total=get_video_lwh(video_path)[0], desc=f"Rendering Incam"):
+        # 渲染网格并将其叠加到原始图像上
         img = renderer.render_mesh(verts_incam[i].cuda(), img_raw, [0.8, 0.8, 0.8])
 
         # # bbx
+        # #  以下代码被注释掉，用于在图像上绘制边界框
         # bbx_xys_ = bbx_xys_render[i].cpu().numpy()
         # lu_point = (bbx_xys_[:2] - bbx_xys_[2:] / 2).astype(int)
         # rd_point = (bbx_xys_[:2] + bbx_xys_[2:] / 2).astype(int)
         # img = cv2.rectangle(img, lu_point, rd_point, (255, 178, 102), 2)
 
+        # 将渲染后的帧写入视频
         writer.write_frame(img)
+        
+    # 关闭视频写入器和读取器
     writer.close()
     reader.close()
 
